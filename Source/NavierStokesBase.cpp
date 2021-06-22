@@ -1049,10 +1049,16 @@ void
 NavierStokesBase::create_umac_grown (int nGrow)
 {
 
-  Array<MultiFab*, AMREX_SPACEDIM> umac_crse;
+  Array<MultiFab*, AMREX_SPACEDIM> umac_crse = {{nullptr}};
   Array<MultiFab*, AMREX_SPACEDIM> umac_fine;
-  AMREX_D_TERM(umac_crse[0] = &getLevel(level-1).u_mac[0];, &getLevel(level-1).u_mac[1];, &getLevel(level-1).u_mac[2];);
-  AMREX_D_TERM(umac_fine[0] = &u_mac[0];, &u_mac[1];, &u_mac[2];);
+  if (level > 0) {
+    AMREX_D_TERM(umac_crse[0] = &getLevel(level-1).u_mac[0];,
+                 umac_crse[1] = &getLevel(level-1).u_mac[1];,
+                 umac_crse[2] = &getLevel(level-1).u_mac[2];);
+  }
+  AMREX_D_TERM(umac_fine[0] = &u_mac[0];,
+               umac_fine[1] = &u_mac[1];,
+               umac_fine[2] = &u_mac[2];);
 
   HydroUtils::create_umac_grown (level, nGrow, grids, geom,
 				 umac_crse, umac_fine, crse_ratio);
