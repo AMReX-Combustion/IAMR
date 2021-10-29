@@ -218,6 +218,19 @@ public:
 		      const amrex::MultiFab* const* beta,
 		      int                           betaComp,
 		      const amrex::MultiFab&        beta_cc);
+	   static void setEBDirichlet(amrex::MLEBABecLap&           op,
+                               const amrex::MultiFab &EBValue,
+                               const amrex::MultiFab &EBBeta);
+    static bool useEBDirichlet() { return (Diffusion::use_EBDirichlet != 0); };
+
+    static void computeExtensiveFluxesEBDirichlet(amrex::MLMG&            a_mg,
+				                             amrex::MultiFab&        Soln,
+				                             amrex::MultiFab* const* flux,
+				                             amrex::MultiFab         &fluxEB,
+				                             const int               fluxComp,
+				                             const int               nomp,
+				                             const amrex::Geometry*  a_geom,
+				                             const amrex::Real       fac );
 #else
     static void setBeta(amrex::MLABecLaplacian&       op,
                         const amrex::MultiFab* const* beta,
@@ -277,6 +290,9 @@ private:
     static int         do_reflux;
     static int         max_order;
     static int         tensor_max_order;
+	 #ifdef AMREX_USE_EB
+    static int         use_EBDirichlet;
+#endif
 };
 
 #endif

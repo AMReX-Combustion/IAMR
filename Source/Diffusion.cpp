@@ -49,6 +49,10 @@ int         Diffusion::max_order;
 int         Diffusion::scale_abec;
 int         Diffusion::tensor_max_order;
 
+#ifdef AMREX_USE_EB
+int         Diffusion::use_EBDirichlet;
+#endif
+
 Vector<Real> Diffusion::visc_coef;
 Vector<int>  Diffusion::is_diffusive;
 
@@ -98,14 +102,18 @@ Diffusion::Diffusion (Amr*               Parent,
         //
         Diffusion::max_order           = 2;
         Diffusion::tensor_max_order    = 2;
-
+#ifdef AMREX_USE_EB
+        Diffusion::use_EBDirichlet     = 0;
+#endif
         ParmParse ppdiff("diffuse");
 
         ppdiff.query("v",                   verbose);
         ppdiff.query("scale_abec",          scale_abec);
         ppdiff.query("max_order",           max_order);
         ppdiff.query("tensor_max_order",    tensor_max_order);
-
+#ifdef AMREX_USE_EB
+        ppdiff.query("use_EBDirichlet", use_EBDirichlet); 
+#endif
         ppdiff.query("agglomeration", agglomeration);
         ppdiff.query("consolidation", consolidation);
         ppdiff.query("max_fmg_iter", max_fmg_iter);
@@ -1426,6 +1434,15 @@ Diffusion::setViscosity(MLEBTensorOp&          tensorop,
     tensorop.setEBShearViscosity(0, cc_bcoef);
 }
 
+void
+Diffusion::setEBDirichlet(MLEBABecLap&    op,
+                          const MultiFab  &EBValue,
+                          const MultiFab  &EBBeta)
+{
+   AMREX_ASSERT(use_EBDirichlet);
+   op.setEBDirichlet(0,EBValue,EBBeta);
+}
+
 #else
 
 void
@@ -1553,6 +1570,133 @@ Diffusion::computeExtensiveFluxes(MLMG& a_mg, MultiFab& Soln,
       }
    }
 }
+
+#ifdef AMREX_USE_EB
+//
+// return the fluxes multiplied by the area -- extensive fluxes
+// and the cell-centered flux across the EB wall
+//
+void
+Diffusion::computeExtensiveFluxesEBDirichlet(MLMG& a_mg, MultiFab& Soln,
+                                             MultiFab* const* flux,
+                                             MultiFab &fluxEB,
+                                             const int fluxComp,
+                                             const int ncomp,
+                                             const Geometry* a_geom, const Real fac )
+{
+   AMREX_ASSERT(flux[0]->nGrow()==0);
+   AMREX_ASSERT(use_EBDirichlet);
+
+   AMREX_D_TERM(MultiFab flxx(*flux[0], amrex::make_alias, fluxComp, ncomp);,
+                MultiFab flxy(*flux[1], amrex::make_alias, fluxComp, ncomp);,
+                MultiFab flxz(*flux[2], amrex::make_alias, fluxComp, ncomp););
+   std::array<MultiFab*,AMREX_SPACEDIM> fp{AMREX_D_DECL(&flxx,&flxy,&flxz)};
+   MultiFab* ebfp = new MultiFab(fluxEB, amrex::make_alias, fluxComp, ncomp);
+
+   // Get regular face fluxes
+   a_mg.getFluxes({fp},{&Soln},MLLinOp::Location::FaceCentroid);
+
+   // For EB, get the cell-centered flux across the EB wall in cut cells
+   a_mg.getEBFluxes({ebfp},{&Soln});
+
+    //
+    // fixme? which way to define area?
+    //
+    // amrex::MultiFab area[BL_SPACEDIM];
+    // DistributionMapping dmap = Soln.DistributionMap();
+    // BoxArray ba = Soln.boxArray();
+    // for (int dir = 0; dir < BL_SPACEDIM; ++dir)
+    // {
+    //     area[dir].clear();
+    // 	area[dir].define(ba.surroundingNodes(dir),dmap,1,nghost);
+    //     a_geom->GetFaceArea(area[dir],dir);
+    // }
+
+   const Real*  dx = a_geom->CellSize();
+#if ( AMREX_SPACEDIM == 3 )
+   Real areax = dx[1]*dx[2];
+   Real areay = dx[0]*dx[2];
+   Real areaz = dx[0]*dx[1];
+#else
+   Real areax = dx[1];
+   Real areay = dx[0];
+#endif
+
+   auto const& ebfactory = dynamic_cast<EBFArrayBoxFactory const&>(Soln.Factory());
+   Array< const MultiCutFab*,AMREX_SPACEDIM> areafrac;
+   areafrac  = ebfactory.getAreaFrac();
+
+   MFItInfo mfi_info;
+   if (Gpu::notInLaunchRegion()) mfi_info.EnableTiling().SetDynamic(true);
+
+#ifdef _OPENMP
+#pragma omp parallel if (Gpu::notInLaunchRegion())
+#endif
+   for (MFIter mfi(Soln, mfi_info); mfi.isValid(); ++mfi)
+   {
+      D_TERM( const auto& fx = flxx.array(mfi);,
+              const auto& fy = flxy.array(mfi);,
+              const auto& fz = flxz.array(mfi););
+
+      D_TERM( const Box ubx = mfi.nodaltilebox(0);,
+              const Box vbx = mfi.nodaltilebox(1);,
+              const Box wbx = mfi.nodaltilebox(2););
+
+      Box bx = mfi.tilebox();
+
+      const EBFArrayBox&     cc_fab = static_cast<EBFArrayBox const&>(Soln[mfi]);
+      const EBCellFlagFab&    flags = cc_fab.getEBCellFlagFab();
+
+      if ( flags.getType(amrex::grow(bx,0)) == FabType::covered )
+      {
+         //
+         // For now, set to very large num so we know if you accidentally use it
+         // MLMG will set covered fluxes to zero
+         //
+         AMREX_D_TERM(AMREX_PARALLEL_FOR_4D(ubx, ncomp, i, j, k, n, {fx(i,j,k,n) = COVERED_VAL;});,
+                      AMREX_PARALLEL_FOR_4D(vbx, ncomp, i, j, k, n, {fy(i,j,k,n) = COVERED_VAL;});,
+                      AMREX_PARALLEL_FOR_4D(wbx, ncomp, i, j, k, n, {fz(i,j,k,n) = COVERED_VAL;}););
+      }
+      else if ( flags.getType(amrex::grow(bx,0)) != FabType::regular )
+      {
+         AMREX_D_TERM( const auto& afrac_x = areafrac[0]->array(mfi);,
+                       const auto& afrac_y = areafrac[1]->array(mfi);,
+                       const auto& afrac_z = areafrac[2]->array(mfi););
+
+         D_TERM(AMREX_PARALLEL_FOR_4D(ubx, ncomp, i, j, k, n, {fx(i,j,k,n) *= fac*areax*afrac_x(i,j,k);});,
+                AMREX_PARALLEL_FOR_4D(vbx, ncomp, i, j, k, n, {fy(i,j,k,n) *= fac*areay*afrac_y(i,j,k);});,
+                AMREX_PARALLEL_FOR_4D(wbx, ncomp, i, j, k, n, {fz(i,j,k,n) *= fac*areaz*afrac_z(i,j,k);}););
+      }
+      else
+      {
+         D_TERM(AMREX_PARALLEL_FOR_4D(ubx, ncomp, i, j, k, n, {fx(i,j,k,n) *= fac*areax;});,
+                AMREX_PARALLEL_FOR_4D(vbx, ncomp, i, j, k, n, {fy(i,j,k,n) *= fac*areay;});,
+                AMREX_PARALLEL_FOR_4D(wbx, ncomp, i, j, k, n, {fz(i,j,k,n) *= fac*areaz;}););
+      }
+   }
+
+   // Scale the EB fluxes by the EB area in cut-cells
+   const MultiCutFab* eb_area = &(ebfactory.getBndryArea());
+#ifdef _OPENMP
+#pragma omp parallel if (Gpu::notInLaunchRegion())
+#endif
+   for (MFIter mfi(*ebfp, mfi_info); mfi.isValid(); ++mfi)
+   {
+      Box bx = mfi.tilebox();
+
+      const EBFArrayBox&     cc_fab = static_cast<EBFArrayBox const&>(Soln[mfi]);
+      const EBCellFlagFab&    flags = cc_fab.getEBCellFlagFab();
+
+      // Do something only in non-fully covered or regular
+ //     if ( flags.getType(amrex::grow(bx,0)) != FabType::regular ) {
+   if ((flags.getType (amrex :: grow (bx, 0 ))!= FabType::regular) && (flags.getType (amrex :: grow (bx, 0 ))!= FabType::covered)) { 
+         const auto& ebArea = eb_area->const_array(mfi);
+         const auto& ebFlux = ebfp->array(mfi);
+         AMREX_PARALLEL_FOR_4D(bx, ncomp, i, j, k, n, {ebFlux(i,j,k,n) *= fac*ebArea(i,j,k);});
+      }
+   }
+}
+#endif
 
 void
 Diffusion::getViscTerms (MultiFab&              visc_terms,
